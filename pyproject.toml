@@ -1,0 +1,23 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project.urls]
+Home = "https://github.com/salva/py-msgraphfs"
+
+[project]
+name = "msgraphfs"
+authors = [{name = "Salvador Fandiño", email = "sfandino@yahoo.com"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = ["License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)"]
+
+version = "0.1"
+description = "FUSE based MS Graph File System"
+
+dependencies = [
+    "python-fuse",
+    "graph-sdk"
+]
+
+[project.optional-dependencies]
