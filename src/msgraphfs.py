@@ -380,8 +380,7 @@ class GraphFS(pyfuse3.Operations):
     async def rmdir(self, parent_inode, name, ctx):
         parent_node = self._node_by_inode(parent_inode)
         node = await self._lookup(parent_node, name)
-        if not node.is_dir():
-            raise pyfuse3.FUSEError(errno.ENOTDIR)
+        self._check_dir(node)
         if node.child_count:
             raise pyfuse3.FUSEError(errno.ENOTEMPTY)
         if node.special_folder is not None:
@@ -397,8 +396,7 @@ class GraphFS(pyfuse3.Operations):
     async def unlink(self, parent_inode, name, ctx):
         parent_node = self._node_by_inode(parent_inode)
         node = await self._lookup(parent_node, name)
-        if not node.is_file():
-            raise pyfuse3.FUSEError(errno.EACCES)
+        self._check_file(node)
         url = self._node_url(node)
         r = await self._delete_raw(url)
         if r.status_code == 204:
