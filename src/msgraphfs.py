@@ -381,23 +381,38 @@ class GraphFS(pyfuse3.Operations):
         parent_node = self._node_by_inode(parent_inode)
         node = await self._lookup(parent_node, name)
         if not node.is_dir():
-            pyfuse3.FUSEError(errno.ENOTDIR)
+            raise pyfuse3.FUSEError(errno.ENOTDIR)
         if node.child_count:
-            pyfuse3.FUSEError(errno.ENOTEMPTY)
+            raise pyfuse3.FUSEError(errno.ENOTEMPTY)
         if node.special_folder is not None:
-            pyfuse3.FUSEError(errno.EPERM)
+            raise pyfuse3.FUSEError(errno.EPERM)
         url = self._node_url(node)
         r = await self._delete_raw(url)
-        logging.info(f"response code: {r.status_code}\n{u8(r.content)}")
         if r.status_code == 204:
             del parent_node.children[name]
             return 0
+        logging.error(f"response code: {r.status_code}\n{u8(r.content)}")
+        raise pyfuse3.FUSEError(errno.EIO)
+
+    async def unlink(self, parent_inode, name, ctx):
+        parent_node = self._node_by_inode(parent_inode)
+        node = await self._lookup(parent_node, name)
+        if not node.is_file():
+            raise pyfuse3.FUSEError(errno.EACCES)
+        url = self._node_url(node)
+        r = await self._delete_raw(url)
+        if r.status_code == 204:
+            del parent_node.children[name]
+            return 0
+        logging.error(f"response code: {r.status_code}\n{u8(r.content)}")
         raise pyfuse3.FUSEError(errno.EIO)
 
     async def rename(self,
                      parent_inode_old, name_old,
                      parent_inode_new, name_new,
                      flags, ctx):
+
+        # TODO: handle correctly the case where parent_new is :me root
         parent_node_old = self._node_by_inode(parent_inode_old)
         node = await self._lookup(parent_node_old, name_old)
         parent_node_new = self._node_by_inode(parent_inode_new)
