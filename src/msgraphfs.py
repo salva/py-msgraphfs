@@ -203,25 +203,25 @@ class GraphFS(pyfuse3.Operations):
         try:
             attrs["ctime"] = date2epoch_ns(data["createdDateTime"])
         except:
-            logging.exception("Unable to retrieve createDateTime")
+            logging.warn("Unable to retrieve createDateTime")
         try:
             attrs["mtime"] = date2epoch_ns(data["lastModifiedDateTime"])
         except:
-            logging.exception("Unable to retrieve lastModifiedDateTime")
+            logging.warn("Unable to retrieve lastModifiedDateTime")
         if type == "f":
             try:
                 attrs["download_url"] = data["@microsoft.graph.downloadUrl"]
             except:
-                logging.exception("Unable to retrieve downloadUrl")
+                logging.warn("Unable to retrieve downloadUrl")
         elif type == "d":
             try:
                 attrs["child_count"] = data["folder"]["childCount"]
             except:
-                logging.exception("Unable to retrieve child count")
+                logging.warn("Unable to retrieve child count")
             try:
                 attrs["special_folder"] = data["specialFolder"]["name"]
             except:
-                logging.exception("Unable to retrieve special folder name")
+                logging.debug("Unable to retrieve special folder name")
 
         child = self._alloc_or_refresh_node(type, id=data["id"], **attrs)
         return (bs(data["name"]), child)
@@ -461,6 +461,11 @@ class GraphFS(pyfuse3.Operations):
 
     def _patch_raw(self, url, **kwargs): # Implicit async!
         return self._send_raw(self._client.patch, url, **kwargs)
+
+    def _options_raw(self, url, headers={}, **kwargs):
+        headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
+        url = self._mkurl(url)
+        return self._client.options(url, headers=headers, **kwargs)
 
     async def _delete_raw(self, url, headers={}, **kwargs):
         headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
