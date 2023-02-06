@@ -505,7 +505,7 @@ class GraphFS(pyfuse3.Operations):
         r = await e.flush(self)
         if r:
             self._alloc_or_refresh_node_from_response(r)
-        pyfuse3.invalidate_inode(e.node.st.st_ino)
+        pyfuse3.invalidate_inode(e.node.st.st_ino, attr_only=True)
 
     async def release(self, fileno):
         logging.info(f"release({fileno})")
@@ -514,7 +514,7 @@ class GraphFS(pyfuse3.Operations):
         if r:
             self._alloc_or_refresh_node_from_response(r)
         self._filenos_available.append(fileno)
-        pyfuse3.invalidate_inode(e.node.st.st_ino)
+        pyfuse3.invalidate_inode(e.node.st.st_ino, attr_only=True)
 
     async def mkdir(self, parent_inode, name, mode, ctx):
         parent_node = self._inode2node(parent_inode)
