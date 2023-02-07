@@ -19,6 +19,8 @@ import httpx
 import datetime
 import dateutil.parser
 import tempfile
+import math
+import time
 
 faulthandler.enable()
 UID = os.geteuid()
@@ -29,14 +31,31 @@ graph_url = "https://graph.microsoft.com/v1.0"
 # expire data after given seconds
 expiration = 30
 
+startup_time_ns = math.floor(time.time() * 1e9)
+
 def bs(s):
+    if s is None:
+        return None
     return bytes(s, "utf-8")
 
+def clean_name(s):
+    if s is None:
+        return None
+    if "/" in s:
+        s = s.replace("/", "_(slash)_")
+    return bs(s)
+
+
 def u8(b):
+    if b is None:
+        return None
     return b.decode("utf-8")
 
-def date2epoch_ns(txt):
-    return dateutil.parser.isoparse(txt).timestamp()*1000000000
+def date2epoch_ns(txt, alt=0):
+    if txt is not None:
+        return math.floor(dateutil.parser.isoparse(txt).timestamp() * 1e9)
+    else:
+        return alt
 
 def attr2dict(st):
     return {'ino': st.st_ino,
@@ -71,25 +90,42 @@ def flags2set(flags):
                 s.append(n)
     return set(s)
 
-class NodeAny():
-    def __init__(self, id=None, inode=None, **kwargs):
+class Node():
+    def __init__(self, id, inode=0, drive=None, mode=0):
         self.id = id
+        self.real_id = id
+        self.drive = drive
         st = pyfuse3.EntryAttributes()
         self.st = st
         st.st_ino = inode
         st.generation = 0
         st.entry_timeout = 60
         st.attr_timeout = 60
+        st.st_mode = mode
         st.st_uid = UID
         st.st_gid = GID
         st.st_rdev = 0
-        self.refresh(**kwargs)
+        st.st_size = 0
+        st.st_ctime_ns = 0
+        st.st_mtime_ns = 0
+        st.st_atime_ns = 0
 
-    def refresh(self, ctime=0, mtime=None, size=0):
+    async def populate(self, fs, res=None):
+        if res is None:
+            try:
+                res = await fs._get(self.url())
+            except:
+                logging.exception("populate failed")
+                raise pyfuse3.FUSEError(errno.EIO)
+        self._populate(res)
+        #logging.debug(f"Node is now {self.to_json()}")
+
+    def _populate(self, res):
+        self.real_id = res.get("id", self.id)
         st = self.st
-        st.st_size = size
-        st.st_ctime_ns = ctime
-        st.st_mtime_ns = st.st_ctime_ns if mtime is None else mtime
+        st.st_size = res.get("size", 0)
+        st.st_ctime_ns = date2epoch_ns(res.get("createdDateTime"))
+        st.st_mtime_ns = date2epoch_ns(res.get("lastModifiedDateTime"), st.st_ctime_ns)
         st.st_atime_ns = st.st_mtime_ns
 
     def is_file(self):
@@ -98,46 +134,172 @@ class NodeAny():
     def is_dir(self):
         return False
 
-    def _to_dict(self):
+    def to_dict(self):
         r = {**self.__dict__, 'st': attr2dict(self.st)}
+        r = {k: u8(v) if isinstance(v, bytes) else v for k, v in r.items()}
+        if r["drive"] is not None:
+            # print(f"Replacing object {r['drive']} for JSON dump")
+            r["drive"] = r["drive"].id
         try:
             r["children"] = [u8(c) for c in r["children"].keys()]
         except:
             pass
         return r
 
-    def _to_json(self):
-        return json.dumps(self._to_dict())
+    def to_json(self):
+        return json.dumps(self.to_dict())
 
-class DirNode(NodeAny):
+    def url(self, path=""):
+        if self.drive is not None:
+            return self.drive.item_url(self.id, path)
+        logging.error(f"Can't generate URL for Node {self.id} (inode: {self.st.st_ino}) because drive is None")
+        raise pyfuse3.FUSEError(errno.EIO)
+
+    async def getattr(self, fs):
+        await self.populate(fs)
+        return self.st
+
+class FileNode(Node):
+    def __init__(self, **kwargs):
+        super().__init__(mode=stat.S_IFREG | 0o600, **kwargs)
+
+    def _populate(self, res):
+        super()._populate(res)
+        self.download_url = res.get("downloadUrl", None)
+
+    def is_file(self):
+        return True
+
+class DirNode(Node):
     def __init__(self, children = None, **kwargs):
-        super().__init__(**kwargs)
-        self.st.st_mode = stat.S_IFDIR | 0o700
+        super().__init__(mode= stat.S_IFDIR | 0o700, **kwargs)
         self.children = children
 
     def is_dir(self):
         return True
 
-    def refresh(self, child_count=0, special_folder=None, **kwargs):
-        super().refresh(**kwargs)
-        self.child_count = child_count
-        self.special_folder = special_folder
+    async def mkdir(self, fs, name):
+        raise fuse.FUSEError(EACCES)
 
-class FileNode(NodeAny):
-    def __init__(self, download_url = None, **kwargs):
+class FolderNode(DirNode):
+    _child_class = {}
+
+    def _populate(self, res):
+        super()._populate(res)
+        self.child_count = res.get("folder", {}).get("childCount", 0)
+        self.special_folder_name = bs(res.get("specialFolder", {}).get("name"))
+
+    def url(self, path=""):
+        return self.drive.item_url(self.id, path)
+
+    def drive_for_items(self):
+        return self.drive
+
+    def children_url(self):
+        return self.url("/children")
+
+    async def _list_children(self, fs):
+        res = await fs._get(self.children_url())
+        return { bs(v["name"]): v for v in res["value"] }
+
+    async def list(self, fs):
+        if True: # if self.children is None:
+            ls = await self._list_children(fs)
+            self.children = {}
+            for name, res in ls.items():
+                logging.info(f"child_class: {self._child_class}")
+                for entry, klass in self._child_class.items():
+                    if entry in res:
+                        logging.info(f"creating object of class {klass}")
+                        node = await fs._alloc_or_populate_node_from_response(klass, res, drive=self.drive_for_items())
+                        self.children[name] = node
+                        break
+                else:
+                    logging.error(f"Can't handle value {json.dumps(res)}, keys: {list(self._child_class.keys())}")
+        return self.children
+
+    async def mkdir(self, fs, name):
+        url = self.children_url()
+        r = await fs._post_raw(url, data = { "name": u8(name),
+                                             "folder": {},
+                                             "@microsoft.graph.conflictBehavior": "fail" })
+        if r.status_code == 201: # Created!
+            node = await fs._alloc_or_populate_from_response(self._child_class["folder"], r.json(), drive=self.drive_for_items())
+            if self.children is not None:
+                self.children[name] = node
+            return node.st
+        if r.status_code == 409: # Conflict!
+            raise pyfuse3.FUSEError(errno.EEXIST)
+        else:
+            logging.error(f"Unexpected response for mkdir: code: {r.status_code}")
+            raise pyfuse3.FUSEError(errno.EIO) # Unhandled response
+
+FolderNode._child_class["folder"] = FolderNode
+FolderNode._child_class["file"] = FileNode
+
+class DriveNode(FolderNode):
+    def drive_for_items(self):
+        return self
+
+    def item_url(self, item_id, path=""):
+        return f"{self.drive_url()}/items/{item_id}{path}"
+
+    def drive_url(self):
+        return f"/drives/{self.id}"
+
+class MeNode(DriveNode):
+    def drive_url(self):
+        return f"/me/drive"
+
+    def url(self, path=""):
+        return f"/me/drive/root{path}"
+
+class GroupNode(DriveNode):
+    def drive_url(self):
+        return f"/groups/{self.id}/drive"
+
+    def children_url(self):
+        return f"/groups/{self.id}/drive/root/children"
+
+class GroupsNode(DriveNode):
+    _child_class = { 'groupTypes': GroupNode }
+
+    def url(self, path=""):
+        return f"/groups{path}"
+
+    def children_url(self):
+        return "/groups"
+
+    async def _list_children(self, fs):
+        res = await fs._get(self.children_url())
+        children = { clean_name(v["displayName"]): v for v in res["value"] }
+        logging.info(f"Children: {children.keys()}")
+        return children
+
+    def item_url(self, item_id, path):
+        return f"/groups/{item_id}{path}"
+
+class SyntheticNode(DirNode):
+    _children_decl = []
+
+    async def populate(self, fs, res=None):
+        pass
+
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.st.st_mode = stat.S_IFREG | 0o600
-        self.download_url = download_url
+        self.st.st_ctime_ns = startup_time_ns
+        self.st.st_mtime_ns = startup_time_ns
+        self.st.st_atime_ns = startup_time_ns
 
-    def is_file(self):
-        return True
+    async def list(self, fs):
+        self.children = {}
+        for name, id, klass in self._children_decl:
+            self.children[name] = await fs._alloc_or_populate_node_from_id(klass, id)
+        return self.children
 
-    def refresh(self, download_url=None, **kwargs):
-        old = self._to_json()
-        super().refresh(**kwargs)
-        self.download_url = download_url
-        new = self._to_json()
-        logging.info(f"node updated {old} --> {new}")
+class RootNode(SyntheticNode):
+    _children_decl = [(b"me", ":me", MeNode),
+                      (b"groups", ":groups", GroupsNode)]
 
 class Handler():
     def __init__(self, node):
@@ -257,7 +419,6 @@ class GraphFS(pyfuse3.Operations):
         super().__init__()
         self._tenant = tenant
         self._graph_token = graph_token
-
         self._last_inode = pyfuse3.ROOT_INODE
         self._fileno_max = 0
         self._filenos_available = [0]
@@ -265,8 +426,8 @@ class GraphFS(pyfuse3.Operations):
         self._by_id={}
         self._open_files = {}
         self._open_dirs = {}
-        self._init_skeleton()
         self._client = httpx.AsyncClient()
+        self._alloc_node(RootNode, ":root", inode=pyfuse3.ROOT_INODE)
 
     def _alloc_fileno(self):
         try:
@@ -284,125 +445,52 @@ class GraphFS(pyfuse3.Operations):
         except:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-    def _init_skeleton(self):
-        me_node = self._alloc_node("d", id=":me")
-        root_node = self._alloc_node("d", id=":root",
-                                     inode=pyfuse3.ROOT_INODE,
-                                     children = { b"me": me_node })
+    def _alloc_inode(self):
+        self._last_inode += 1
+        return self._last_inode
 
-    def _alloc_node(self, type, id, inode=None, **kwargs):
+    def _alloc_node(self, klass, id, inode=None, **kwargs):
         if inode is None:
             inode = self._alloc_inode()
-        klass = DirNode if type == "d" else FileNode
+        logging.info(f"inode {inode} allocated for node {id}, class: {klass}!")
         node = klass(id=id, inode=inode, **kwargs)
         self._by_inode[inode] = node
         self._by_id[id] = node
         return node
 
-    def _alloc_or_refresh_node(self, type, id, **kwargs):
-        try:
+    async def _alloc_or_populate_node_from_id(self, klass, id, res=None, drive=None):
+        if id in self._by_id:
             node = self._by_id[id]
-            if type == "f":
-                assert node.is_file()
-            else:
-                assert node.is_dir()
-            node.refresh(**kwargs)
-            return node
-        except:
-            return self._alloc_node(type, id, **kwargs)
+        else:
+            node = self._alloc_node(klass, id, drive=drive)
+        if not isinstance(node, klass):
+            logging.error(f"Node klass ({type(node)}) not as expected ({klass}).")
+            raise pyfuse3.FUSEError(errno.EIO)
+        await node.populate(self, res)
+        return node
 
-    def _alloc_or_refresh_node_from_response(self, data):
-        type = "f" if "file" in data else "d"
-        attrs = {"size": data.get("size", 0) }
-        try:
-            attrs["ctime"] = date2epoch_ns(data["createdDateTime"])
-        except:
-            logging.warn("Unable to retrieve createDateTime")
-        try:
-            attrs["mtime"] = date2epoch_ns(data["lastModifiedDateTime"])
-        except:
-            logging.warn("Unable to retrieve lastModifiedDateTime")
-        if type == "f":
-            try:
-                attrs["download_url"] = data["@microsoft.graph.downloadUrl"]
-            except:
-                logging.warn("Unable to retrieve downloadUrl")
-        elif type == "d":
-            try:
-                attrs["child_count"] = data["folder"]["childCount"]
-            except:
-                logging.warn("Unable to retrieve child count")
-            try:
-                attrs["special_folder"] = data["specialFolder"]["name"]
-            except:
-                logging.debug("Unable to retrieve special folder name")
-
-        child = self._alloc_or_refresh_node(type, id=data["id"], **attrs)
-        return (bs(data["name"]), child)
-
-    def _alloc_inode(self):
-        self._last_inode += 1
-        return self._last_inode
+    async def _alloc_or_populate_node_from_response(self, klass, res, drive=None):
+        id = res["id"]
+        return await self._alloc_or_populate_node_from_id(klass, id, res=res, drive=drive)
 
     async def lookup(self, parent_inode, name, ctx=None):
         logging.info(f"lookup({parent_inode}, {name})")
         parent_node = self._inode2node(parent_inode)
         node = await self._lookup(parent_node, name)
-        return await self._getattr(node)
+        return await node.getattr(self)
 
     async def _lookup(self, parent_node, name):
-        children = parent_node.children
-        if not children or name not in children:
-            await self._refresh_dir(parent_node)
+        children = await parent_node.list(self)
         try:
-            return parent_node.children[name]
+            return children[name]
         except:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-    def _node_url(self, node, path=""):
-        id = node.id
-        if id.startswith(":"):
-            if id == ":me":
-                return f"/me/drive/root{path}"
-            raise pyfuse3.FUSEError(errno.EACCES)
-        return f"/me/drive/items/{id}{path}"
-
-    async def _refresh_dir(self, node):
-        try:
-            url = self._node_url(node, "/children")
-        except: # Static directory, no need to refresh!
-            return
-        r = await self._get(url)
-        try:
-            node.children = {}
-            for v in r["value"]:
-                (name, child) = self._alloc_or_refresh_node_from_response(v)
-                node.children[name] = child
-                if child.is_dir():
-                    logging.debug(f"child: [{node.st.st_ino}, {node.id} | {v['name']}] --> [{child.st.st_ino}, {child.id}]")
-        except:
-            logging.exception("Exception caught while reloading directory")
-            raise pyfuse3.FUSEError(errno.EIO)
-
     async def getattr(self, inode, ctx=None):
         node = self._inode2node(inode)
-        st = await self._getattr(node)
+        st = await node.getattr(self)
         logging.info(f"getattr({inode} [{node.id}]) --> {attr2dict(st)}")
         return st
-
-    async def _getattr(self, node):
-        try:
-            st = node.st
-            # TODO: check expiration
-        except:
-            await self._fill_attr(node)
-
-        logging.info(f"_getattr({node.id}) --> {attr2dict(node.st)}")
-        return node.st
-
-    async def _fill_attr(self, node):
-        data = await self._get(self._node_url(node))
-        self._alloc_or_refresh_node_from_response(data)
 
     def _check_dir(self, node):
         if not node.is_dir():
@@ -418,9 +506,11 @@ class GraphFS(pyfuse3.Operations):
         fileno = self._alloc_fileno()
         try:
             e = DirHandler(node)
-            await self._refresh_dir(node)
-            e.entries = list(node.children.keys())
+            children = await node.list(self)
+            e.entries = list(children.keys())
+            logging.info(f"DirHandler created for {len(e.entries)} entries")
         except:
+            logging.exception("opendir failed")
             self._filenos_available.append(fileno)
             raise
         self._open_dirs[fileno] = e
@@ -428,11 +518,19 @@ class GraphFS(pyfuse3.Operations):
 
     async def readdir(self, fileno, start_id, token):
         e = self._open_dirs[fileno]
-        for i in range(start_id, len(e.entries)):
-            st = await self._getattr(e.node.children[e.entries[i]])
-            ok = pyfuse3.readdir_reply(token, e.entries[i], st, i+1)
-            if not ok:
-                break
+        top = len(e.entries)
+        for ix in range(start_id, top):
+            name = e.entries[ix]
+            try:
+                node = await self._lookup(e.node, name)
+                st = await node.getattr(self)
+                ok = pyfuse3.readdir_reply(token, name, st, ix+1)
+                logging.info(f"called readdir cb for {name}, ix: {ix}  -> {ok}")
+                if not ok:
+                    return 0
+            except:
+                logging.exception(f"Lookup for entry {e.entries[ix]} in node {e.node} failed")
+        return 1
 
     async def releasedir(self, fileno):
         self._open_dirs.pop(fileno)
@@ -442,7 +540,7 @@ class GraphFS(pyfuse3.Operations):
         self._check_file(node)
         try:
             if True or node.download_url is None:
-                url = self._node_url(node, "/content")
+                url = node.url("/content")
                 r = await self._get_raw(url)
                 if r.status_code == 302:
                     node.download_url = r.headers["Location"]
@@ -454,7 +552,7 @@ class GraphFS(pyfuse3.Operations):
     async def _put_empty_at_url(self, url):
         r = await self._put_raw(url, content=b'')
         if r.status_code in (200, 201): # Ok, Created!
-            return self._alloc_or_refresh_node_from_response(r.json())
+            return self._alloc_or_populate_node_from_response(r.json())
         else:
             raise pyfuse3.FUSEError(errno.EIO)
 
@@ -504,7 +602,7 @@ class GraphFS(pyfuse3.Operations):
         e = self._open_files[fileno]
         r = await e.flush(self)
         if r:
-            self._alloc_or_refresh_node_from_response(r)
+            self._alloc_or_populate_node_from_response(r)
         pyfuse3.invalidate_inode(e.node.st.st_ino, attr_only=True)
 
     async def release(self, fileno):
@@ -512,25 +610,13 @@ class GraphFS(pyfuse3.Operations):
         e = self._open_files.pop(fileno)
         r = await e.release(self)
         if r:
-            self._alloc_or_refresh_node_from_response(r)
+            self._alloc_or_populate_node_from_response(r)
         self._filenos_available.append(fileno)
         pyfuse3.invalidate_inode(e.node.st.st_ino, attr_only=True)
 
     async def mkdir(self, parent_inode, name, mode, ctx):
         parent_node = self._inode2node(parent_inode)
-        url = self._node_url(parent_node, "/children")
-        r = await self._post_raw(url, data = { "name": u8(name),
-                                               "folder": {},
-                                               "@microsoft.graph.conflictBehavior": "fail" })
-        if r.status_code == 201: # Created!
-            (name, node) = self._alloc_or_refresh_node_from_response(r.json())
-            if node.children is not None:
-                node.children[name] = node
-            return node.st
-        if r.status_code == 409: # Conflict!
-            raise pyfuse3.FUSEError(errno.EEXIST)
-        logging.error(f"Unexpected response for mkdir: code: {r.status_code}")
-        raise pyfuse3.FUSEError(errno.EIO) # Unhandled response
+        await parent_node.mkdir(fs, name)
 
     async def rmdir(self, parent_inode, name, ctx):
         parent_node = self._inode2node(parent_inode)
@@ -581,7 +667,12 @@ class GraphFS(pyfuse3.Operations):
 
     async def _get(self, url, **kwargs):
         r = await self._get_raw(url, **kwargs)
-        return r.json()
+        if r.status_code < 300:
+            return r.json()
+        if r.status_code == 403:
+            raise pyfuse3.FUSEError(errno.EACCES)
+        logging.error("GET {url} failed: {r.status_code}")
+        raise pyfuse3.FUSEError(errno.EIO)
 
     def _mkurl(self, url):
         if url.startswith('/'):
