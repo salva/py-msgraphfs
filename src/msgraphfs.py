@@ -29,7 +29,8 @@ BLKSIZE = 65536
 graph_url = "https://graph.microsoft.com/v1.0"
 
 # expire data after given seconds
-expiration = 30
+external_expiration = 5
+expiration = 15
 
 startup_time_ns = math.floor(time.time() * 1e9)
 
@@ -45,17 +46,34 @@ def clean_name(s):
         s = s.replace("/", "_(slash)_")
     return bs(s)
 
-
 def u8(b):
     if b is None:
         return None
     return b.decode("utf-8")
 
-def date2epoch_ns(txt, alt=0):
+def date2ns(txt, alt=0):
     if txt is not None:
         return math.floor(dateutil.parser.isoparse(txt).timestamp() * 1e9)
     else:
         return alt
+
+def _init_blocks(st):
+    st.st_blksize = BLKSIZE
+    st.st_blocks = (st.st_size + BLKSIZE - 1) // BLKSIZE
+
+def gen_thrower(error_name):
+    error_code = getattr(errno, error_name)
+    def thrower():
+        try:
+            raise pyfuse3.FUSEError(error_code)
+        except:
+            logging.exception(f"Error {error_name}")
+            raise
+    return thrower
+
+for error_name in ('EIO', 'EACCES', 'EISDIR', 'ENOTDIR', 'EBADF',
+                   'ENOSYS', 'ENOENT', 'ENOTEMPTY', 'ENOENT', 'ENOTSUP'):
+    globals()[error_name] = gen_thrower(error_name)
 
 def attr2dict(st):
     return {'ino': st.st_ino,
@@ -95,12 +113,13 @@ class Node():
         self.id = id
         self.real_id = id
         self.drive = drive
+        self.expiration = 0
         st = pyfuse3.EntryAttributes()
-        self.st = st
+        self._st = st
         st.st_ino = inode
         st.generation = 0
-        st.entry_timeout = 60
-        st.attr_timeout = 60
+        st.entry_timeout = external_expiration
+        st.attr_timeout = external_expiration
         st.st_mode = mode
         st.st_uid = UID
         st.st_gid = GID
@@ -109,24 +128,30 @@ class Node():
         st.st_ctime_ns = 0
         st.st_mtime_ns = 0
         st.st_atime_ns = 0
+        st.st_blocks = 0
+        st.st_blksize = BLKSIZE
 
-    async def populate(self, fs, res=None):
+    def inode(self):
+        return self._st.st_ino
+
+    async def populate(self, fs, res=None, force=False):
         if res is None:
-            try:
-                res = await fs._get(self.url())
-            except:
-                logging.exception("populate failed")
-                raise pyfuse3.FUSEError(errno.EIO)
-        self._populate(res)
+            if force or self.expiration < time.time():
+                res = await fs._get_as_json(self.url())
+            else:
+                return
+        self._populate(fs, res)
         #logging.debug(f"Node is now {self.to_json()}")
 
-    def _populate(self, res):
+    def _populate(self, fs, res):
+        self.expiration = time.time() + expiration
         self.real_id = res.get("id", self.id)
-        st = self.st
+        st = self._st
         st.st_size = res.get("size", 0)
-        st.st_ctime_ns = date2epoch_ns(res.get("createdDateTime"))
-        st.st_mtime_ns = date2epoch_ns(res.get("lastModifiedDateTime"), st.st_ctime_ns)
+        st.st_ctime_ns = date2ns(res.get("createdDateTime"))
+        st.st_mtime_ns = date2ns(res.get("lastModifiedDateTime"), st.st_ctime_ns)
         st.st_atime_ns = st.st_mtime_ns
+        _init_blocks(st)
 
     def is_file(self):
         return False
@@ -134,60 +159,262 @@ class Node():
     def is_dir(self):
         return False
 
-    def to_dict(self):
-        r = {**self.__dict__, 'st': attr2dict(self.st)}
-        r = {k: u8(v) if isinstance(v, bytes) else v for k, v in r.items()}
-        if r["drive"] is not None:
-            # print(f"Replacing object {r['drive']} for JSON dump")
-            r["drive"] = r["drive"].id
-        try:
-            r["children"] = [u8(c) for c in r["children"].keys()]
-        except:
-            pass
-        return r
+    def ensure_file(self):
+        if not self.is_file():
+            EISDIR()
+
+    def ensure_dir(self):
+        if not self.is_dir():
+            ENOTDIR()
 
     def to_json(self):
-        return json.dumps(self.to_dict())
+        r = {**self.__dict__, 'st': attr2dict(self._st)}
+        r = {k: u8(v) if isinstance(v, bytes) else v for k, v in r.items()}
+        if r["drive"] is not None:
+            r["drive"] = r["drive"].id
+        if r["children"] is not None:
+            r["children"] = [u8(c) for c in r["children"].keys()]
+        return json.dumps(r)
 
     def url(self, path=""):
         if self.drive is not None:
             return self.drive.item_url(self.id, path)
-        logging.error(f"Can't generate URL for Node {self.id} (inode: {self.st.st_ino}) because drive is None")
-        raise pyfuse3.FUSEError(errno.EIO)
+        logging.error(f"Can't generate URL for Node {self.id} (inode: {self._st.st_ino}) because drive is None")
+        EIO()
 
     async def getattr(self, fs):
         await self.populate(fs)
-        return self.st
+        return self._st
+
+    async def mkdir(self, fs, name):
+        ENOTDIR()
+
+    async def create(self, fs, name):
+        ENOTDIR()
+
+    async def lookup(self, fs, name):
+        ENOTDIR()
+
+    async def open(self, fs):
+        EISDIR()
+
+    async def setattr(self, fs, attr, fields):
+        if fields.update_mtime:
+            mtime = math.floor(attr.st_mtime_ns / 1e9)
+        else:
+            mtime = math.floor(time.time())
+        mtime_iso8601 = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        res = await fs._patch_as_json(self.url(),
+                                      data = { "lastModifiedDateTime": mtime_iso8601 })
+        self._populate(fs, res)
+
+    async def unlink(self, fs):
+        EISDIR()
+
+    async def rmdir(self, fs):
+        ENOTDIR()
+
+    async def delete(self, fs):
+        url = self.url()
+        res = await fs._delete(url, accepted_codes=[204])
+
+    async def move(self, fs, new_parent, new_name):
+        url = self.url("?@microsoft.graph.conflictBehavior=replace")
+        res = await fs._patch_as_json(url, data={ "parentReference": { "id": new_parent.real_id },
+                                                  "name": u8(new_name) })
+        self._populate(fs, res)
 
 class FileNode(Node):
     def __init__(self, **kwargs):
         super().__init__(mode=stat.S_IFREG | 0o600, **kwargs)
+        self._local_fh = None
+        self._writers = 0
+        self._changed = 0
 
-    def _populate(self, res):
-        super()._populate(res)
-        self.download_url = res.get("downloadUrl", None)
+    def _populate(self, fs, res):
+        super()._populate(fs, res)
+        self._download_url = res.get("downloadUrl", None)
+        if self._local_fh is not None:
+            self._patch_attrs_from_local()
 
     def is_file(self):
         return True
+
+    def _patch_attrs_from_local(self):
+        if self._local_fh is None:
+            EIO()
+        st = self._st
+        local_st = os.fstat(self._local_fh.fileno())
+        st.st_size = local_st.st_size
+        st.st_mtime_ns = math.floor(local_st.st_mtime*1e9)
+        st.st_atime_ns = st.st_mtime_ns
+        _init_blocks(st)
+
+    async def getattr(self, fs):
+        if self._local_fh is None:
+            return await super().getattr(fs)
+        if self._st.st_ctime_ns == 0:
+            await self.populate(fs)
+        self._patch_attrs_from_local()
+        return self._st
+
+    async def _init_local_fh(self, fs, flags):
+        # TODO: set a semaphore here!
+        trunc = (flags & os.O_TRUNC) != 0
+        if self._local_fh is None:
+            self._local_fh = tempfile.NamedTemporaryFile(mode='w+b', delete=False)
+            if self._st.st_size > 0 and not trunc:
+                await self._download_to_local(fs)
+                self._changed = False
+            else:
+                self._changed = True
+            await self._remote_truncate(fs)
+        elif trunc:
+            os.truncate(self._local_fh.fileno(), 0)
+
+    async def download_url(self, fs):
+        if self._download_url is None:
+            url = self.url("/content")
+            res = await fs._get(url, accepted_codes=[302])
+            if "Location" in res.headers:
+                self._download_url = res.headers["Location"]
+            else:
+                EIO()
+        return self._download_url
+
+    async def _download_to_local(self, fs):
+        url = await self.download_url(fs)
+        async with fs._get_stream(url) as res:
+            logging.info(f"GET streaming {url} --> status code: {res.status_code}") # , headers: {r.headers}")
+            async for chunk in res.aiter_bytes():
+                self._local_fh.write(chunk)
+
+    async def upload_url(self, fs):
+        return self.url("/content")
+
+    async def _upload_from_local(self, fs):
+        url = await self.upload_url(fs)
+        async def gen(file):
+            logging.info("upload_from_local generator started")
+            file.seek(0)
+            while True:
+                data = file.read(16384)
+                if data == b'':
+                    logging.info("generator done generating data")
+                    return
+                logging.info(f"generator yielding {len(data)} bytes")
+                yield data
+
+        res = await fs._put_as_json(url, content = gen(self._local_fh))
+        logging.info(f"file {self.id} uploaded")
+        return res
+
+    async def open(self, fs, flags):
+        logging.info(f"open({self.id} [inode: {self._st.st_ino}], flags: {flags2set(flags)})")
+        if (flags & os.O_ACCMODE) != os.O_RDONLY:
+            await self._init_local_fh(fs, flags)
+            self._writers += 1
+        klass = accmode2class[flags&os.O_ACCMODE]
+        fh = klass(self, flags)
+        return fh
+
+    async def write(self, fs, off, buffer, append=False):
+        if self._local_fh is None:
+            EBADF()
+        self._changed = True
+        # TODO: sem here!
+        if append:
+            self._local_fh.seek(0, 2)
+        else:
+            self._local_fh.seek(off)
+        self._local_fh.write(buffer)
+
+    async def read(self, fs, off, size):
+        if self._local_fh is None:
+            # File is not cached locally
+            url = await self.download_url(fs)
+            res = await fs._get(url, headers={"Range": f"bytes={off}-{off+size-1}"})
+            return res.content
+        else:
+            # TODO: sem here!
+            self._local_fh.seek(off)
+            return self._local_fh.read(size)
+
+    async def flush(self, fs):
+        if self._changed:
+            self._changed = False
+            res = await self._upload_from_local(fs)
+            self._populate(fs, res)
+
+    async def release(self, fs):
+        await self.flush(fs)
+        self._writers -= 1
+        # TODO: handle when to forget the file!
+
+    async def setattr(self, fs, attr, fields):
+        if fields.size:
+            if attr.st_size == 0:
+                await self.truncate(fs)
+            else:
+                ENOSYS()
+        return await super().setattr(fs, attr, fields)
+
+    async def truncate(self, fs):
+        await self._remote_truncate(self, fs)
+        if self._local_fh is not None:
+            self._local_fh.truncate(0)
+            self._changed = True
+
+    async def _remote_truncate(self, fs):
+        res = await fs._put_as_json(self.url("/content"), content=b"")
+        self._populate(fs, res)
 
 class DirNode(Node):
     def __init__(self, children = None, **kwargs):
         super().__init__(mode= stat.S_IFDIR | 0o700, **kwargs)
         self.children = children
+        self.children_expiration = time.time() + expiration
 
     def is_dir(self):
         return True
 
-    async def mkdir(self, fs, name):
-        raise fuse.FUSEError(EACCES)
+    async def lookup(self, fs, name):
+        children = await self.list(fs)
+        try:
+            return children[name]
+        except:
+            ENOENT()
 
 class FolderNode(DirNode):
     _child_class = {}
 
-    def _populate(self, res):
-        super()._populate(res)
-        self.child_count = res.get("folder", {}).get("childCount", 0)
+    def _populate_children(self, fs, res, incremental=False):
+        unwrapped = self._children_values_in_response(res)
+        if incremental:
+            if self.children is None:
+                return
+        else:
+            if unwrapped is None:
+                self.children = None
+                self.children_expiration = 0
+                logging.info("No children in response, ignoring it")
+                return
+            self.children = {}
+            self.children_expiration = time.time() + expiration
+
+        for name, value in unwrapped.items():
+            child = self._unpack_child(fs, value)
+            #logging.info(f"Populating {child.id} with {json.dumps(value)}")
+            child._populate(fs, value)
+            self.children[name] = child
+
+    def _populate(self, fs, res):
+        super()._populate(fs, res)
+        self._child_count = res.get("folder", {}).get("childCount", 0)
         self.special_folder_name = bs(res.get("specialFolder", {}).get("name"))
+        incremental = "@odata.nextLink" in res
+        self._populate_children(fs, res, incremental=incremental)
 
     def url(self, path=""):
         return self.drive.item_url(self.id, path)
@@ -198,41 +425,100 @@ class FolderNode(DirNode):
     def children_url(self):
         return self.url("/children")
 
-    async def _list_children(self, fs):
-        res = await fs._get(self.children_url())
-        return { bs(v["name"]): v for v in res["value"] }
+    async def child_count(self, fs):
+        await self.populate(fs, force=True)
+        logging.info(f"Requested child count: {self._child_count}")
+        return self._child_count
+
+    def _children_values_in_response(self, res):
+        if "value" in res:
+            return { bs(v["name"]): v for v in res["value"] }
+        return None
+
+    def _unpack_child(self, fs, value):
+        for entry, klass in self._child_class.items():
+            if entry in value:
+                return fs._alloc_or_populate_node_from_response(klass, value, drive=self.drive_for_items())
+        logging.error(f"Can't handle value {json.dumps(value)}, keys: {list(self._child_class.keys())}")
 
     async def list(self, fs):
-        if True: # if self.children is None:
-            ls = await self._list_children(fs)
-            self.children = {}
-            for name, res in ls.items():
-                logging.info(f"child_class: {self._child_class}")
-                for entry, klass in self._child_class.items():
-                    if entry in res:
-                        logging.info(f"creating object of class {klass}")
-                        node = await fs._alloc_or_populate_node_from_response(klass, res, drive=self.drive_for_items())
-                        self.children[name] = node
-                        break
-                else:
-                    logging.error(f"Can't handle value {json.dumps(res)}, keys: {list(self._child_class.keys())}")
+        now = time.time()
+        if self.children is None or self.children_expiration < now:
+            if self.children is None:
+                logging.info(f"Loading directory {self.id}")
+            else:
+                logging.info(f"Directory expired {self.id} exp: {self.children_expiration}, now: {now}")
+
+            res = await fs._get_as_json(self.children_url())
+            self._populate_children(fs, res)
+            while "@odata.nextLink" in res:
+                logging.info(f"Directory listing continues at {res['@odata.nextLink']}")
+                res = await fs._get_as_json(res["@odata.nextLink"])
+                self._populate_children(fs, res, incremental=True)
+        else:
+            logging.info(f"Directory listing {self.id} is still recent")
         return self.children
 
     async def mkdir(self, fs, name):
         url = self.children_url()
-        r = await fs._post_raw(url, data = { "name": u8(name),
-                                             "folder": {},
-                                             "@microsoft.graph.conflictBehavior": "fail" })
-        if r.status_code == 201: # Created!
-            node = await fs._alloc_or_populate_from_response(self._child_class["folder"], r.json(), drive=self.drive_for_items())
-            if self.children is not None:
-                self.children[name] = node
-            return node.st
-        if r.status_code == 409: # Conflict!
-            raise pyfuse3.FUSEError(errno.EEXIST)
-        else:
-            logging.error(f"Unexpected response for mkdir: code: {r.status_code}")
-            raise pyfuse3.FUSEError(errno.EIO) # Unhandled response
+        res = await fs._post_as_json(url,
+                                     data={ "name": u8(name),
+                                            "folder": {},
+                                            "@microsoft.graph.conflictBehavior": "fail" },
+                                     accepted_codes=[201])
+        node = fs._alloc_or_populate_node_from_response(self._child_class["folder"],
+                                                        res, drive=self.drive_for_items())
+        self._receive_child(name, node)
+        return node
+
+    async def create(self, fs, name):
+        res = await fs._put_as_json(self.url(f":/{u8(name)}:/content"),
+                                    content=b"")
+        node = fs._alloc_or_populate_node_from_response(self._child_class['file'],
+                                                        res,
+                                                        drive=self.drive_for_items())
+        self._receive_child(name, node)
+        logging.info(f"New empty file created inside {self.id}")
+        return node
+
+    async def delete_child(self, fs, name, child):
+        logging.info(f"Deleting node of class {type(child)}")
+        await child.delete(fs)
+        self._forget_child(name, child)
+
+    def _forget_child(self, name, child):
+        try:
+            del self.children[name]
+        except:
+            logging.exception("Object just deleted from directory not found in children list, ignoring it!")
+        self.expiration = 0
+
+    async def unlink(self, fs, name):
+        child = await self.lookup(fs, name)
+        child.ensure_file()
+        await self.delete_child(fs, name, child)
+
+    async def rmdir(self, fs, name):
+        child = await self.lookup(fs, name)
+        child.ensure_dir()
+        child_count = await child.child_count(fs)
+        if child_count != 0:
+            ENOTEMPTY()
+        await self.delete_child(fs, name, child)
+
+    def _receive_child(self, name, child):
+        if self.children is not None:
+            self.children[name] = child
+        self.expiration = 0
+
+    async def rename(self, fs, old_name, new_parent_node, new_name):
+        new_parent_node.ensure_dir()
+        if self.drive_for_items() is not new_parent_node.drive_for_items():
+            EXDEV()
+        child = await self.lookup(fs, old_name)
+        await child.move(fs, new_parent_node, new_name)
+        self._forget_child(old_name, child)
+        new_parent_node._receive_child(new_name, child)
 
 FolderNode._child_class["folder"] = FolderNode
 FolderNode._child_class["file"] = FileNode
@@ -270,11 +556,8 @@ class GroupsNode(DriveNode):
     def children_url(self):
         return "/groups"
 
-    async def _list_children(self, fs):
-        res = await fs._get(self.children_url())
-        children = { clean_name(v["displayName"]): v for v in res["value"] }
-        logging.info(f"Children: {children.keys()}")
-        return children
+    def _children_values_in_response(self, res):
+        return { clean_name(v["displayName"]): v for v in res["value"] }
 
     def item_url(self, item_id, path):
         return f"/groups/{item_id}{path}"
@@ -287,14 +570,16 @@ class SyntheticNode(DirNode):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.st.st_ctime_ns = startup_time_ns
-        self.st.st_mtime_ns = startup_time_ns
-        self.st.st_atime_ns = startup_time_ns
+        self._st.st_ctime_ns = startup_time_ns
+        self._st.st_mtime_ns = startup_time_ns
+        self._st.st_atime_ns = startup_time_ns
 
     async def list(self, fs):
-        self.children = {}
-        for name, id, klass in self._children_decl:
-            self.children[name] = await fs._alloc_or_populate_node_from_id(klass, id)
+        if self.children is None:
+            self.children = {}
+            self.chidren_expiration = sys.maxsize
+            for name, id, klass in self._children_decl:
+                self.children[name] = fs._alloc_or_populate_node_from_id(klass, id)
         return self.children
 
 class RootNode(SyntheticNode):
@@ -308,99 +593,44 @@ class Handler():
     async def start(self, fs):
         pass
 
+    async def flush(self, fs):
+        pass
+
+    async def release(self, fs):
+        pass
+
+    async def write(self, *_):
+        logging.error("Write access in RDONLY file handle attempted")
+        EACCES()
+
+    async def read(self, *_):
+        logging.error("Read access in WRONLY file handle attempted")
+        EACCES()
+
 class FileHandler(Handler):
     def __init__(self, node, flags):
         super().__init__(node)
         self.flags = flags
-        self.download_url = None
-
-    async def start(self, fs):
-        await super().start(fs)
-        self.download_url = await fs._download_url(self.node)
-
-    async def flush(self, fs):
-        pass
-
-    async def release(self, fs):
-        pass
+        self.append = (flags & os.O_APPEND) != 0
 
 class RdFileHandler(FileHandler):
-    async def read(self, fs, offset, size):
-        r = await fs._get_raw(self.download_url, headers={"Range": f"bytes={offset}-{offset+size-1}"})
-        return r.content
-
-    async def write(self, *_):
-        logging.error("Write access in RDONLY file handle attempted")
-        raise pyfuse3.FUSEError(errno.EACCES)
+    async def read(self, fs, off, size):
+        return await self.node.read(fs, off, size)
 
 class WrFileHandler(FileHandler):
-    def __init__(self, node, flags):
-        super().__init__(node, flags)
-        self.upload_url = None
-        self.local_fh = None
-        self.append = False
-        self.changed = False
-
-    async def read(self, *_):
-        logging.error("Read access in WRONLY file handle attempted")
-        raise pyfuse3.FUSEError(errno.EACCES)
-
-    async def start(self, fs):
-        await super().start(fs)
-        node = self.node
-        self.upload_url = fs._node_url(node, "/content")
-        if self.flags & os.O_APPEND:
-            self.append = True # We actually ignore this and hope for the OS doing its dutties!
-        self.local_fh = tempfile.NamedTemporaryFile(mode='w+b', delete=False)
-        if node.st.st_size > 0:
-            if (self.flags & os.O_TRUNC):
-                (node, _) = await fs._put_empty_at_url(self.upload_url)
-            else:
-                await self._download_to_local(fs)
-
     async def write(self, fs, off, buffer):
-        self.changed = True
-        self.local_fh.seek(off)
-        self.local_fh.write(buffer)
+        await self.node.write(fs, off, buffer, append=self.append)
         return len(buffer)
 
-    async def _download_to_local(self, fs):
-        url = self.download_url
-        async with fs._get_stream(url) as r:
-            logging.info(f"GET streaming {url} --> status code: {r.status_code}, headers: {r.headers}")
-            async for chunk in r.aiter_bytes():
-                self.local_fh.write(chunk)
-
     async def flush(self, fs):
-        if self.changed:
-            self.changed = False
-            self.local_fh.seek(0)
-            return await self._upload_from_local(fs)
+        await self.node.flush(fs)
 
     async def release(self, fs):
-        return await self.flush(fs)
-
-    async def _upload_from_local(self, fs):
-        async def gen(file):
-            logging.info("upload_from_local generator started")
-            file.seek(0)
-            while True:
-                data = file.read(16384)
-                if data == b'':
-                    logging.info("generator done generating data")
-                    return
-                logging.info(f"generator yielding {len(data)} bytes")
-                yield data
-
-        r = await fs._put_raw(self.upload_url, content = gen(self.local_fh))
-        if r.status_code == 200:
-            return r.json()
-        raise pyfuse3.FUSEError(errno.EIO)
+        await self.node.release(fs)
 
 class RdWrFileHandler(WrFileHandler):
-    async def read(self, fs, offset, size):
-        self.local_fh.seek(offset)
-        return self.local_fh.read(size)
+    def read(self, fs, off, size): # implicit async!
+        return self.node.read(fs, off, size)
 
 accmode2class = { os.O_RDONLY: RdFileHandler,
                   os.O_WRONLY: WrFileHandler,
@@ -410,12 +640,11 @@ class DirHandler(Handler):
     pass
 
 class GraphFS(pyfuse3.Operations):
-
     supports_dot_lookup = False
     enable_acl = False
     enable_writeback_cache = False
 
-    def __init__(self, tenant, graph_token):
+    def __init__(self, tenant, graph_token)
         super().__init__()
         self._tenant = tenant
         self._graph_token = graph_token
@@ -424,8 +653,7 @@ class GraphFS(pyfuse3.Operations):
         self._filenos_available = [0]
         self._by_inode={}
         self._by_id={}
-        self._open_files = {}
-        self._open_dirs = {}
+        self._handler_by_fileno = {}
         self._client = httpx.AsyncClient()
         self._alloc_node(RootNode, ":root", inode=pyfuse3.ROOT_INODE)
 
@@ -436,6 +664,12 @@ class GraphFS(pyfuse3.Operations):
             self._fileno_max += 1
             return self._fileno_max
 
+    def _register_handler(self, fh):
+        fileno = self._alloc_fileno()
+        self._handler_by_fileno[fileno] = fh
+        logging.info(f"fh {fh} registered with number {fileno}")
+        return fileno
+
     def _release_fileno(self, fileno):
         self._filenos_available.append(fileno)
 
@@ -443,7 +677,13 @@ class GraphFS(pyfuse3.Operations):
         try:
             return self._by_inode[inode]
         except:
-            raise pyfuse3.FUSEError(errno.ENOENT)
+            ENOENT()
+
+    def _fileno2handler(self, fileno):
+        try:
+            return self._handler_by_fileno[fileno]
+        except:
+            ENOENT()
 
     def _alloc_inode(self):
         self._last_inode += 1
@@ -458,33 +698,25 @@ class GraphFS(pyfuse3.Operations):
         self._by_id[id] = node
         return node
 
-    async def _alloc_or_populate_node_from_id(self, klass, id, res=None, drive=None):
+    def _alloc_or_populate_node_from_id(self, klass, id, res=None, drive=None):
         if id in self._by_id:
             node = self._by_id[id]
         else:
             node = self._alloc_node(klass, id, drive=drive)
         if not isinstance(node, klass):
             logging.error(f"Node klass ({type(node)}) not as expected ({klass}).")
-            raise pyfuse3.FUSEError(errno.EIO)
-        await node.populate(self, res)
+            EIO()
         return node
 
-    async def _alloc_or_populate_node_from_response(self, klass, res, drive=None):
+    def _alloc_or_populate_node_from_response(self, klass, res, drive=None):
         id = res["id"]
-        return await self._alloc_or_populate_node_from_id(klass, id, res=res, drive=drive)
+        return self._alloc_or_populate_node_from_id(klass, id, res=res, drive=drive)
 
     async def lookup(self, parent_inode, name, ctx=None):
         logging.info(f"lookup({parent_inode}, {name})")
         parent_node = self._inode2node(parent_inode)
-        node = await self._lookup(parent_node, name)
+        node = await parent_node.lookup(self, name)
         return await node.getattr(self)
-
-    async def _lookup(self, parent_node, name):
-        children = await parent_node.list(self)
-        try:
-            return children[name]
-        except:
-            raise pyfuse3.FUSEError(errno.ENOENT)
 
     async def getattr(self, inode, ctx=None):
         node = self._inode2node(inode)
@@ -494,241 +726,181 @@ class GraphFS(pyfuse3.Operations):
 
     def _check_dir(self, node):
         if not node.is_dir():
-            raise pyfuse3.FUSEError(errno.ENOTDIR)
+            ENOTDIR()
 
     def _check_file(self, node):
         if not node.is_file():
-            raise pyfuse3.FUSEError(errno.ENOTSUP)
+            ENOTSUP()
 
     async def opendir(self, inode, ctx):
         node = self._inode2node(inode)
         self._check_dir(node)
-        fileno = self._alloc_fileno()
-        try:
-            e = DirHandler(node)
-            children = await node.list(self)
-            e.entries = list(children.keys())
-            logging.info(f"DirHandler created for {len(e.entries)} entries")
-        except:
-            logging.exception("opendir failed")
-            self._filenos_available.append(fileno)
-            raise
-        self._open_dirs[fileno] = e
-        return fileno
+        dh = DirHandler(node)
+        children = await node.list(self)
+        dh.entries = list(children.keys())
+        dirno = self._register_handler(dh)
+        logging.info(f"DirHandler at {node.id} [inode: {inode}] created with number {dirno} with {len(dh.entries)} entries")
+        return dirno
 
-    async def readdir(self, fileno, start_id, token):
-        e = self._open_dirs[fileno]
-        top = len(e.entries)
-        for ix in range(start_id, top):
-            name = e.entries[ix]
+    async def readdir(self, dirno, start_id, token):
+        dh = self._fileno2handler(dirno)
+        for ix in range(start_id, len(dh.entries)):
+            name = dh.entries[ix]
             try:
-                node = await self._lookup(e.node, name)
+                node = await dh.node.lookup(self, name)
                 st = await node.getattr(self)
                 ok = pyfuse3.readdir_reply(token, name, st, ix+1)
-                logging.info(f"called readdir cb for {name}, ix: {ix}  -> {ok}")
+                # logging.info(f"called readdir cb for {name}, ix: {ix}  -> {ok}")
                 if not ok:
-                    return 0
+                    return False
             except:
-                logging.exception(f"Lookup for entry {e.entries[ix]} in node {e.node} failed")
-        return 1
+                logging.exception(f"Lookup for entry {dh.entries[ix]} in node {dh.node} failed, ignoring it")
+        return True
 
-    async def releasedir(self, fileno):
-        self._open_dirs.pop(fileno)
-        self._filenos_available.append(fileno)
+    async def releasedir(self, dirno):
+        dh = self._fileno2handler(dirno)
+        self._handler_by_fileno.pop(dirno)
+        self._filenos_available.append(dirno)
 
-    async def _download_url(self, node):
-        self._check_file(node)
-        try:
-            if True or node.download_url is None:
-                url = node.url("/content")
-                r = await self._get_raw(url)
-                if r.status_code == 302:
-                    node.download_url = r.headers["Location"]
-                    logging.info(f"Download URL for {node.id} is {node.download_url}")
-            return node.download_url
-        except:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-
-    async def _put_empty_at_url(self, url):
-        r = await self._put_raw(url, content=b'')
-        if r.status_code in (200, 201): # Ok, Created!
-            return self._alloc_or_populate_node_from_response(r.json())
+    async def setattr(self, inode, attr, fields, fileno, ctx):
+        if fileno is None:
+            node = self._inode2node(inode)
         else:
-            raise pyfuse3.FUSEError(errno.EIO)
+            fh = self._fileno2handler(fileno)
+            node = fh.node
+        await node.setattr(self, attr, fields)
+        return await node.getattr(self)
 
     async def create(self, parent_inode, name, mode, flags, ctx):
         parent_node = self._inode2node(parent_inode)
-        logging.info(f"create({parent_inode} [id: {parent_node.id}], name: {name}, mode: {oct(mode)}, flags: {hex(flags)} [{flags2set(flags)}])")
-        url = self._node_url(parent_node, f":/{u8(name)}:/content")
-        (_, node) = await self._put_empty_at_url(url)
-        parent_node.children[name] = node
-        logging.info(f"Created node: {node._to_json()}")
-        fi = await self.open(node.st.st_ino, flags, ctx)
-        return (fi, node.st)
+        node = await parent_node.create(self, name)
+        fi = await self.open(node.inode(), flags, ctx)
+        attr = await node.getattr(self)
+        return (fi, attr)
 
     async def open(self, inode, flags, ctx):
         node = self._inode2node(inode)
-        logging.info(f"open(inode: {inode} [id: {node.id}], flags: {flags2set(flags)})")
-        klass = accmode2class[flags&os.O_ACCMODE]
-        fh = klass(node, flags)
-        try:
-            await fh.start(self)
-        except:
-            logging.exception("start failed")
-            raise
-        fileno = self._alloc_fileno()
-        self._open_files[fileno] = fh
-        logging.info(f"open(inode: {inode}) succeeded")
+        fh = await node.open(self, flags)
+        fileno = self._register_handler(fh)
+        logging.info(f"open {node.id} [inode: {inode}] succeeded, fh: {fh}, fileno: {fileno}")
         return pyfuse3.FileInfo(fh=fileno, direct_io=False, keep_cache=False)
 
-    async def _open(self, node, flags):
-
-        return fh
-
-    async def read(self, fileno, offset, size):
-        e = self._open_files[fileno]
-        content = await e.read(self, offset, size)
-        logging.info(f"read(fileno: {fileno}, offset: {offset}, size: {size}) --> {len(content)} bytes")
+    async def read(self, fileno, off, size):
+        fh = self._fileno2handler(fileno)
+        content = await fh.read(self, off, size)
+        logging.info(f"read(fileno: {fileno} [fh: {fh}], off: {off}, size: {size}) --> {len(content)} bytes")
         return content
 
-    async def write(self, fileno, offset, buffer):
-         e = self._open_files[fileno]
-         r = await e.write(self, offset, buffer)
-         logging.info(f"write(fileno: {fileno}, offset: {offset}, buffer: {len(buffer)} bytes) --> {r} bytes")
-         return r
+    async def write(self, fileno, off, buffer):
+         fh = self._fileno2handler(fileno)
+         logging.info(f"writing fileno: {fileno}, fh: {fh}, off: {off}, buffer: {len(buffer)} bytes")
+         await fh.write(self, off, buffer)
+         return len(buffer)
 
     async def flush(self, fileno):
         logging.info(f"flush(fileno: {fileno})")
-        e = self._open_files[fileno]
-        r = await e.flush(self)
-        if r:
-            self._alloc_or_populate_node_from_response(r)
-        pyfuse3.invalidate_inode(e.node.st.st_ino, attr_only=True)
+        fh = self._fileno2handler(fileno)
+        await fh.flush(self)
+        attr = await fh.node.getattr(self)
+        pyfuse3.invalidate_inode(fh.node.inode(), attr_only=True)
 
     async def release(self, fileno):
         logging.info(f"release({fileno})")
-        e = self._open_files.pop(fileno)
-        r = await e.release(self)
-        if r:
-            self._alloc_or_populate_node_from_response(r)
+        fh = self._fileno2handler(fileno)
+        await fh.release(self)
+        pyfuse3.invalidate_inode(fh.node.inode(), attr_only=True)
+        self._handler_by_fileno.pop(fileno)
         self._filenos_available.append(fileno)
-        pyfuse3.invalidate_inode(e.node.st.st_ino, attr_only=True)
 
     async def mkdir(self, parent_inode, name, mode, ctx):
         parent_node = self._inode2node(parent_inode)
-        await parent_node.mkdir(fs, name)
+        child = await parent_node.mkdir(self, name)
+        return await child.getattr(self)
 
     async def rmdir(self, parent_inode, name, ctx):
         parent_node = self._inode2node(parent_inode)
-        node = await self._lookup(parent_node, name)
-        self._check_dir(node)
-        if node.child_count:
-            raise pyfuse3.FUSEError(errno.ENOTEMPTY)
-        if node.special_folder is not None:
-            raise pyfuse3.FUSEError(errno.EPERM)
-        url = self._node_url(node)
-        r = await self._delete_raw(url)
-        if r.status_code == 204:
-            del parent_node.children[name]
-            return 0
-        logging.error(f"response code: {r.status_code}\n{u8(r.content)}")
-        raise pyfuse3.FUSEError(errno.EIO)
+        node = await parent_node.rmdir(self, name)
+
+    async def rename(self,
+                     old_parent_inode, old_name,
+                     new_parent_inode, new_name,
+                     flags, ctx):
+        old_parent_node = self._inode2node(old_parent_inode)
+        new_parent_node = self._inode2node(new_parent_inode)
+        await old_parent_node.rename(self, old_name, new_parent_node, new_name)
 
     async def unlink(self, parent_inode, name, ctx):
         parent_node = self._inode2node(parent_inode)
-        node = await self._lookup(parent_node, name)
-        url = self._node_url(node)
-        r = await self._delete_raw(url)
-        if r.status_code == 204:
-            del parent_node.children[name]
-            return 0
-        logging.error(f"response code: {r.status_code}\n{u8(r.content)}")
-        raise pyfuse3.FUSEError(errno.EIO)
+        await parent_node.unlink(self, name)
 
-    async def rename(self,
-                     parent_inode_old, name_old,
-                     parent_inode_new, name_new,
-                     flags, ctx):
+    def _get_as_json(self, url, **kwargs): # Implicit async!
+        return self._send_as_json('get', url, **kwargs)
 
-        # TODO: handle correctly the case where parent_new is :me root
-        parent_node_old = self._inode2node(parent_inode_old)
-        node = await self._lookup(parent_node_old, name_old)
-        parent_node_new = self._inode2node(parent_inode_new)
+    def _get(self, url, **kwargs): # implicit async!
+        return self._send('get', url, **kwargs)
 
-        url = self._node_url(node, "?@microsoft.graph.conflictBehavior=replace")
-        r = await self._patch_raw(url, data={ "parentReference": { "id": parent_node_new.id },
-                                              "name": u8(name_new) })
-        if r.status_code == 200:
-            node = parent_node_old.children.pop(name_old)
-            parent_node_new.children[name_new] = node
-            await self._fill_attr(node)
-            return 0
-        raise pyfuse3.FUSEError(errno.EIO)
+    def _post_as_json(self, url, **kwargs): # Implicit async!
+        return self._send_as_json('post', url, **kwargs)
 
-    async def _get(self, url, **kwargs):
-        r = await self._get_raw(url, **kwargs)
-        if r.status_code < 300:
-            return r.json()
-        if r.status_code == 403:
-            raise pyfuse3.FUSEError(errno.EACCES)
-        logging.error("GET {url} failed: {r.status_code}")
-        raise pyfuse3.FUSEError(errno.EIO)
+    def _post(self, url, **kwargs): # Implicit async!
+        return self._send('post', url, **kwargs)
+
+    def _patch_as_json(self, url, **kwargs):
+        return self._send_as_json('patch', url, **kwargs)
+
+    def _patch(self, url, **kwargs): # Implicit async!
+        return self._send('patch', url, **kwargs)
+
+    def _put_as_json(self, url, **kwargs): # Implicit async!
+        return self._send_as_json('put', url, **kwargs)
+
+    def _put(self, url, **kwargs): # implicit async!
+        return self._send('put', url, **kwargs)
+
+    def _delete_as_json(self, url, **kwargs): # Implicit async!
+        return self._send_as_json('delete', url, **kwargs)
+
+    def _delete(self, url, **kwargs): # implicit async!
+        return self._send('delete', url, **kwargs)
+
+    async def _send_as_json(self, method, url, **kwargs):
+        res = await self._send(method, url, **kwargs)
+        return res.json()
 
     def _mkurl(self, url):
         if url.startswith('/'):
             return graph_url + url
         return url
 
-    def _get_raw(self, url, headers = {}, **kwargs): # implicit async!
+    async def _send(self, method, url, accepted_codes=None, data=None, headers={}, **kwargs):
+        logging.info(f"SEND({method}) {url}")
         headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
-        url = self._mkurl(url)
-        logging.info(f"GET {url}")
-        return self._client.get(url, headers=headers, **kwargs)
-
-    async def _post(self, url, **kwargs):
-        r = await self._post_raw(url, **kwargs)
-        return r.json()
-
-    async def _send_raw(self, method, url, content=None, data=None, headers={}, **kwargs):
-        headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
-        if content is None:
-            content = json.dumps(data)
+        if data is not None:
+            kwargs["content"] = json.dumps(data)
             headers["Content-Type"]="application/json"
-        else:
+        elif "content" in kwargs:
             headers.setdefault("Content-Type", "application/octet-stream")
         url = self._mkurl(url)
-        r = await method(url, content=content, headers=headers, **kwargs)
-        logging.info(f"SEND[*] {url} --> status code: {r.status_code}, headers: {r.headers}, content:\n{u8(r.content)}")
-        return r
-
-    def _post_raw(self, url, **kwargs): # Implicit async!
-        return self._send_raw(self._client.post, url, **kwargs)
-
-    def _patch_raw(self, url, **kwargs): # Implicit async!
-        return self._send_raw(self._client.patch, url, **kwargs)
-
-    def _put_raw(self, url, **kwargs):
-        return self._send_raw(self._client.put, url, **kwargs)
-
-    def _options_raw(self, url, headers={}, **kwargs):
-        headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
-        url = self._mkurl(url)
-        return self._client.options(url, headers=headers, **kwargs)
-
-    async def _delete_raw(self, url, headers={}, **kwargs):
-        headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
-        url = self._mkurl(url)
-        r = await self._client.delete(url, headers=headers, **kwargs)
-        logging.info(f"DELETE {url} --> status code: {r.status_code}, content:\n{u8(r.content)}")
-        return r
+        call = getattr(self._client, method)
+        res = await call(url, headers=headers, **kwargs)
+        if accepted_codes is None:
+            ok = res.status_code < 300
+        else:
+            ok = res.status_code in accepted_codes
+        if ok:
+            logging.debug(f"{method} {url} status code: {res.status_code}")
+            return res
+        logging.warning(f"{method} {url} failed, code: {res.status_code}")
+        if res.status_code == 403:
+            EACCES()
+        logging.debug(f"Response: {res.text}")
+        EIO()
 
     def _get_stream(self, url, headers={}, **kwargs):
+        logging.info(f"GET (stream) {url}")
         headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
         url = self._mkurl(url)
-        logging.info(f"GET stream {url}")
-        stream = self._client.stream('GET', url, headers=headers, **kwargs)
-        logging.info(f"stream: {stream}")
-        return stream
+        return self._client.stream('GET', url, headers=headers, **kwargs)
 
 def init_logging(debug=False):
     formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(threadName)s: '
@@ -808,7 +980,8 @@ def main():
     config = load_config(tenant)
     cred = authenticate(config)
 
-    graph_fs = GraphFS(tenant, cred.get_token("https://graph.microsoft.com/.default").token)
+    graph_fs = GraphFS(tenant,
+                       cred.get_token("https://graph.microsoft.com/.default").token)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=msgraphfs')
     if options.debug_fuse:
