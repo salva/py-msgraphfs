@@ -2,13 +2,14 @@
 NOTICE: This is alpha quality software!!!
 
 It seems to work, but critical bugs that may cause data lost
-or corruption should be expected. Use at your own risk.
+or corruption should be expected. Use it at your own risk.
 ```
 
 # Introduction
 
-`msgraphfs` is a Linux file-system implemented on top of Linux for
-accessing OneDrive and SharePoint drives.
+`msgraphfs` is a Linux file-system implemented on top of
+[FUSE](https://www.kernel.org/doc/html/latest/filesystems/fuse.html)
+for accessing OneDrive and SharePoint drives.
 
 A `msgraphfs` file system grants access to the resources associated to
 a tenant/user pair. In order to access more than one set of resources,
@@ -17,7 +18,7 @@ be mounted.
 
 Currently the file system provides access to the user personal drive
 (`/me`) and to the group drives (`/groups`) with are usually
-associated to Teams teams. Access to other resources is planed
+associated to MS Teams teams. Access to other resources is planed
 
 # Usage
 
@@ -39,7 +40,7 @@ Every section in that file contains the configuration for accessing
 the graph API as a particular tenant/user.
 
 ```
-[Spectre]
+[spectre]
 tenant_id = 0c67513c-cde9-fe90-b6ae-30143fbc76d7
 application_id = adfc6dd2-bc1d-c55c-a414-adf36dd245c
 application_secret = 3rnstStavro8lofe1dApp1icationSecret
