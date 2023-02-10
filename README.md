@@ -55,15 +55,15 @@ The procedure for performing such task are available here:
 https://learn.microsoft.com/en-us/azure/healthcare-apis/register-application
 
 Note that you may need to ask some cloud admin in your organization
-with the required privileges to perform it.
+with the required privileges to do it for you.
 
 
 # Bugs and limitations
 
-- Access to personal OneDrive accounts doesn't work. I guess it is
-  something related to authentication.
+- Access to personal OneDrive accounts doesn't work. The author
+  guesses it is something related to authentication.
 
-- Access to the groups drives is read only. Again, this seems to be a
+- Access to group drives is read only. Again, this seems to be a
   permissions issue.
 
 - No content caching: File contents are not cached locally and so
