@@ -7,7 +7,7 @@ or corruption should be expected. Use at your own risk.
 
 # Introduction
 
-`msgraphfs` is a Linux filesystem implemented on top of Linux for
+`msgraphfs` is a Linux file-system implemented on top of Linux for
 accessing OneDrive and SharePoint drives.
 
 A `msgraphfs` file system grants access to the resources associated to
@@ -87,7 +87,7 @@ contribute!
 # Installation
 
 In the not so distance future, this program would hopefully be
-available as a python package or even from your favourite Linux flavor
+available as a python package or even from your favorite Linux flavor
 repositories... but not yet!
 
 In the meantime, just download the code from the GitHub repo:
