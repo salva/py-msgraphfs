@@ -17,7 +17,7 @@ several instances of the file system with different configurations can
 be mounted.
 
 Currently the file system provides access to the user personal drive
-(`/me`) and to the group drives (`/groups`) with are usually
+(`/me`) and to the group drives (`/groups`) which are usually
 associated to MS Teams teams. Access to other resources is planed
 
 # Usage
