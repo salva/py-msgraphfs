@@ -1,7 +1,7 @@
 ```
 NOTICE: This is alpha quality software!!!
 
-It seems to work, but critical bugs should that may cause data lost
+It seems to work, but critical bugs that may cause data lost
 or corruption should be expected. Use at your own risk.
 ```
 
