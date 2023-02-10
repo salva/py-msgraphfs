@@ -16,8 +16,12 @@ version = "0.1"
 description = "FUSE based MS Graph File System"
 
 dependencies = [
-    "python-fuse",
-    "graph-sdk"
+    "pyfuse3",
+    "azure-identity",
+    "httpx",
+    "trio",
+    "faulthandler",
+    "python-dateutil"
 ]
 
 [project.optional-dependencies]
