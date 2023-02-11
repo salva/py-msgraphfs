@@ -20,8 +20,10 @@ dependencies = [
     "azure-identity",
     "httpx",
     "trio",
-    "faulthandler",
     "python-dateutil"
 ]
 
 [project.optional-dependencies]
+
+[project.scripts]
+msgraphfs = "msgraphfs:main"
