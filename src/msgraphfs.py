@@ -29,6 +29,10 @@ GID = os.getegid()
 BLKSIZE = 65536
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
+HTTP_MAX_RETRIES = 5
+HTTP_RETRY_DELAY = 3
+HTTP_TIMEOUT = 20
+
 # expire data after given seconds
 KERNEL_EXPIRATION = 5
 LOCAL_EXPIRATION = 15
@@ -36,6 +40,16 @@ LOCAL_EXPIRATION = 15
 STARTUP_TIME = math.floor(time.time() * 1e9)
 
 PRIVATE_DIR = Path.home() / ".msgraphfs"
+
+TRANSITORY_HTTP_CODES = {
+    httpx.codes.REQUEST_TIMEOUT,
+    httpx.codes.TOO_MANY_REQUESTS,
+    httpx.codes.INTERNAL_SERVER_ERROR,
+    httpx.codes.BAD_GATEWAY,
+    httpx.codes.SERVICE_UNAVAILABLE,
+    httpx.codes.GATEWAY_TIMEOUT
+}
+
 
 def bs(s):
     if s is None:
@@ -289,9 +303,7 @@ class FileNode(Node):
 
     async def _download_to_local(self, fs):
         url = await self.download_url(fs)
-        async with fs._get_stream(url) as res:
-            async for chunk in res.aiter_bytes():
-                self._local_fh.write(chunk)
+        await fs._get_to_file(url, self._local_fh)
 
     async def upload_url(self, fs):
         return self.url("/content")
@@ -881,24 +893,82 @@ class GraphFS(pyfuse3.Operations):
             headers.setdefault("Content-Type", "application/octet-stream")
         url = self._mkurl(url)
         call = getattr(self._client, method)
-        res = await call(url, headers=headers, **kwargs)
-        if accepted_codes is None:
-            ok = res.status_code < 300
-        else:
-            ok = res.status_code in accepted_codes
-        if ok:
-            return res
-        logging.error(f"HTTP request {method} {url} failed, code: {res.status_code}")
-        if res.status_code == 403:
-            EACCES()
-        logging.debug(f"HTTP request headers: {res.headers}, text: {res.text}")
-        EIO()
 
-    def _get_stream(self, url, headers={}, **kwargs):
-        logging.debug(f"GET (stream) {url}")
+        attempt = 0
+        while True:
+            attempt += 1
+            if attempt > 1:
+                await trio.sleep(HTTP_RETRY_DELAY)
+            try:
+                res = await call(url, headers=headers, timeout=HTTP_TIMEOUT, **kwargs)
+            except httpx.RequestError as ex:
+                if attempts < HTTP_MAX_RETRIES:
+                    logging.warning(f"HTTP request {method} {url} failed, exception {ex}, attempt {attempt}")
+                    continue
+                logging.error(f"HTTP request {method} {url} failed, attempt {attempt}", exc_info=True)
+                EIO()
+
+            if accepted_codes is None:
+                if res.status_code < 300:
+                    return res
+            else:
+                if res.status_code in accepted_codes:
+                    return res
+
+            if ((res.status_code in TRANSITORY_HTTP_CODES) and
+                (attempts < HTTP_MAX_RETRIES)):
+                logging.warning(f"HTTP request {method} {url} failed, code: {res.status_code}, attempt {attempt}")
+                continue
+
+            logging.error(f"HTTP request {method} {url} failed, code: {res.status_code}, attempt {attempt}")
+            if res.status_code == 403:
+                EACCES()
+
+            logging.debug(f"HTTP request headers: {res.headers}, text: {res.text}")
+            EIO()
+
+    def _get_to_file(self, url, local_fh, **kwargs):
+        return self._send_to_file('get', url, local_fh, **kwargs)
+
+    async def _send_to_file(self, method, url, local_fh, accepted_codes=None, json=None, headers={}, **kwargs):
         headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
+        if "content" in kwargs:
+            headers.setdefault("Content-Type", "application/octet-stream")
         url = self._mkurl(url)
-        return self._client.stream('GET', url, headers=headers, **kwargs)
+
+        attempt = 0
+        while True:
+            attempt += 1
+            if attempt > 1:
+                await trio.sleep(HTTP_RETRY_DELAY)
+            try:
+                async with self._client.stream(method, url, headers=headers,
+                                               timeout=HTTP_TIMEOUT, **kwargs) as res:
+
+                    if accepted_codes is None:
+                        if res.status_code >= 300:
+                            res.raise_for_status()
+                    else:
+                        if res.status_code not in accepted_codes:
+                            res.raise_for_status()
+
+                    local_fh.seek(0)
+                    async for chunk in res.aiter_bytes():
+                        local_fh.write(chunk)
+                    return
+
+            except (httpx.RequestError,
+                    httpx.StreamError,
+                    httpx.HTTPStatusError) as ex:
+                code = ex.response.status_code if isinstance(ex, httpx.HTTPStatusError) else None
+                if ((attempts < HTTP_MAX_RETRIES) and
+                    ((code is None) or (code in TRANSITORY_HTTP_CODES))):
+                    logging.warning(f"HTTP request {method} {url} failed, exception: {ex}, code: {code}, attempt {attempt}")
+                    continue
+                logging.error(f"HTTP request {method} {url} failed, exception: {ex}, code: {code}, attempt {attempt}")
+                if code is 403:
+                    EACCES()
+                EIO()
 
 def init_logging(log_fn=None, debug=False):
     if log_fn is not None:
