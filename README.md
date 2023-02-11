@@ -85,6 +85,8 @@ with the required privileges to do it for you.
 - No support for upload sessions. That means that files larger than
   4MB will fail to upload (resulting in data lost).
 
+- Network errors are often fatal. Even timeouts. No retries.
+
 - Several other unknown bugs.
 
 Some of these bugs may be quite easy to fix, and just there because of
