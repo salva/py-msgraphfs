@@ -351,7 +351,7 @@ class FileNode(Node):
         await self.flush(fs)
         self._writers -= 1
         if self._writers <= 0:
-            os.unlink(self._local_fh)
+            os.unlink(self._local_fh.name)
             self._local_fh = None
 
     async def setattr(self, fs, attr, fields):
@@ -646,7 +646,7 @@ class GraphFS(pyfuse3.Operations):
     enable_acl = False
     enable_writeback_cache = False
 
-    def __init__(self, tenant, graph_token)
+    def __init__(self, tenant, graph_token):
         super().__init__()
         self._tenant = tenant
         self._graph_token = graph_token
