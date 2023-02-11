@@ -2,19 +2,20 @@ import os
 import sys
 
 import logging
-#logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
 
 import json
 import configparser
 import argparse
-import pprint
 import stat
 import errno
 import pyfuse3
 import trio
 import faulthandler
 from pathlib import Path
-from azure.identity import InteractiveBrowserCredential, ClientSecretCredential, TokenCachePersistenceOptions, AuthenticationRecord
+from azure.identity import (InteractiveBrowserCredential,
+                            TokenCachePersistenceOptions,
+                            AuthenticationRecord)
 import httpx
 import datetime
 import dateutil.parser
@@ -63,11 +64,13 @@ def _init_blocks(st):
 
 def gen_thrower(error_name):
     error_code = getattr(errno, error_name)
+
     def thrower():
         try:
             raise pyfuse3.FUSEError(error_code)
         except:
-            logging.exception(f"Error {error_name}")
+            logging.debug(f"Error {error_name}", exc_info=True)
+            # logging.exception(f"Error {error_name}")
             raise
     return thrower
 
@@ -925,18 +928,18 @@ def parse_args():
 
     parser.add_argument('tenant', type=str,
                         help='Where to mount the file system')
-    parser.add_argument('mountpoint', type=str,
+    parser.add_argument('mountpoint', type=str, nargs='?',
                         help='Where to mount the file system')
-    parser.add_argument('--debug', action='store_true', default=False,
+    parser.add_argument('-d', '--debug', action='store_true', default=False,
                         help='Enable debugging output')
-    parser.add_argument('--debug-fuse', action='store_true', default=False,
+    parser.add_argument('-D', '--debug-fuse', action='store_true', default=False,
                         help='Enable FUSE debugging output')
     parser.add_argument('-f', '--foreground', action='store_true', default=False,
                         help='Run file system process in the foreground')
     return parser.parse_args()
 
 def load_config(tenant):
-    config_fn = Path.home() / ".config/msgraphfs.ini"
+    config_fn = Path.home() / ".msgraphfs/msgraphfs.ini"
     if not config_fn.is_file():
         raise Exception(f"Configuration file {config_fn} not found")
 
@@ -949,7 +952,7 @@ def load_config(tenant):
     return config
 
 def authenticate(config):
-    ar_fn = Path.home() / f".config/msgraphfs/{config['tenant']}.ini"
+    ar_fn = Path.home() / f".msgraphfs/sessions/{config['tenant']}.ini"
     ar_cfg = configparser.ConfigParser()
     ar_cfg.optionxform = str
     try:
@@ -959,14 +962,20 @@ def authenticate(config):
         logging.exception("Couldn't load authentication record")
         ar = None
 
+    username = config.get("username", None)
+    logging.warning(f"login hint: {username}")
+
     redirect_uri = f"http://localhost:{config['authentication_callback_port']}"
     cred = InteractiveBrowserCredential(tenant_id=config["tenant_id"],
                                         client_id=config["application_id"],
                                         client_credential=config["application_secret"],
+                                        login_hint=username,
                                         redirect_uri=redirect_uri,
                                         cache_persistence_options=TokenCachePersistenceOptions(),
                                         authentication_record=ar)
     ar = cred.authenticate(scopes=["https://graph.microsoft.com/.default"])
+    if username not in (None, ar.username):
+        raise Exception(f"Bad authenticated user name {ar.username} ({username} expected)!")
     try:
         ar_cfg["Authentication Record"] = json.loads(ar.serialize())
         ar_fn.parent.mkdir(exist_ok=True, parents=True)
@@ -976,6 +985,26 @@ def authenticate(config):
     except:
         logging.exception("Unable to save authentication record")
 
+def daemonize():
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+    os.setsid()
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+    os.chdir("/")
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    si = open(os.devnull, 'r')
+    so = open(os.devnull, 'a+')
+    se = open(os.devnull, 'a+')
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(so.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+    logging.info(f"msgraphfs sent to background (pid: {os.getpid()})")
+
 def main():
     options = parse_args()
     init_logging(options.debug)
@@ -984,16 +1013,25 @@ def main():
     config = load_config(tenant)
     cred = authenticate(config)
 
-    if not options.foreground:
-        daemonize()
-
     graph_fs = GraphFS(tenant,
                        cred.get_token("https://graph.microsoft.com/.default").token)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=msgraphfs')
     if options.debug_fuse:
         fuse_options.add('debug')
+
+    mountpoint = options.mountpoint
+    if options.mountpoint is None:
+        try:
+            options.mountpoint = config["mountpoint"]
+        except:
+            raise Exception(f"mountpoint argument missing {config}")
+
     pyfuse3.init(graph_fs, options.mountpoint, fuse_options)
+
+    if not options.foreground:
+        daemonize()
+
     try:
         trio.run(pyfuse3.main)
     except:
