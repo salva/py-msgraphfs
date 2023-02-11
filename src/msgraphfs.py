@@ -35,6 +35,8 @@ expiration = 15
 
 startup_time_ns = math.floor(time.time() * 1e9)
 
+PRIVATE_DIR = Path.home() / ".msgraphfs"
+
 def bs(s):
     if s is None:
         return None
@@ -907,19 +909,14 @@ class GraphFS(pyfuse3.Operations):
         url = self._mkurl(url)
         return self._client.stream('GET', url, headers=headers, **kwargs)
 
-def init_logging(debug=False):
-    formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(threadName)s: '
-                                  '[%(name)s] %(message)s', datefmt="%Y-%m-%d %H:%M:%S")
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
-    root_logger = logging.getLogger()
-    if debug:
-        handler.setLevel(logging.DEBUG)
-        root_logger.setLevel(logging.DEBUG)
-    else:
-        handler.setLevel(logging.INFO)
-        root_logger.setLevel(logging.INFO)
-    root_logger.addHandler(handler)
+def init_logging(log_fn=None, debug=False):
+    if log_fn is not None:
+        Path(log_fn).parent.mkdir(exist_ok=True, parents=True)
+
+    logging.basicConfig(filename=log_fn,
+                        level = logging.DEBUG if debug else logging.WARNING,
+                        format = '%(levelname)s %(asctime)s.%(msecs)03d %(threadName)s: [%(name)s] %(message)s',
+                        datefmt="%Y-%m-%d %H:%M:%S")
 
 def parse_args():
     '''Parse command line'''
@@ -939,7 +936,7 @@ def parse_args():
     return parser.parse_args()
 
 def load_config(tenant):
-    config_fn = Path.home() / ".msgraphfs/msgraphfs.ini"
+    config_fn = PRIVATE_DIR / "msgraphfs.ini"
     if not config_fn.is_file():
         raise Exception(f"Configuration file {config_fn} not found")
 
@@ -952,7 +949,7 @@ def load_config(tenant):
     return config
 
 def authenticate(config):
-    ar_fn = Path.home() / f".msgraphfs/sessions/{config['tenant']}.ini"
+    ar_fn = PRIVATE_DIR / f"sessions/{config['tenant']}.ini"
     ar_cfg = configparser.ConfigParser()
     ar_cfg.optionxform = str
     try:
@@ -1007,39 +1004,40 @@ def daemonize():
 
 def main():
     options = parse_args()
-    init_logging(options.debug)
-
     tenant = options.tenant
     config = load_config(tenant)
+
+    if options.mountpoint is None:
+        try:
+            options.mountpoint = config["mountpoint"]
+        except:
+            raise Exception(f"mountpoint argument missing")
+
+    log_fn = None if options.foreground else PRIVATE_DIR / f"logs/{tenant}.log"
+    init_logging(log_fn, options.debug)
+
     cred = authenticate(config)
 
     graph_fs = GraphFS(tenant,
                        cred.get_token("https://graph.microsoft.com/.default").token)
+
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=msgraphfs')
     if options.debug_fuse:
         fuse_options.add('debug')
 
-    mountpoint = options.mountpoint
-    if options.mountpoint is None:
-        try:
-            options.mountpoint = config["mountpoint"]
-        except:
-            raise Exception(f"mountpoint argument missing {config}")
-
-    pyfuse3.init(graph_fs, options.mountpoint, fuse_options)
-
     if not options.foreground:
         daemonize()
 
     try:
+        pyfuse3.init(graph_fs, options.mountpoint, fuse_options)
         trio.run(pyfuse3.main)
     except:
-        pyfuse3.close(unmount=False)
-        raise
-
-    pyfuse3.close()
-
+        logging.exception("Some unhandled error happened, shutting down file system!")
+        pyfuse3.close(unmount=True)
+    else:
+        logging.info("Unmounting file system and terminating. Have a nice day!")
+        pyfuse3.close(unmount=True)
 
 if __name__ == '__main__':
     main()
