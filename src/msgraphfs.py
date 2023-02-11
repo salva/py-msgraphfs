@@ -931,6 +931,8 @@ def parse_args():
                         help='Enable debugging output')
     parser.add_argument('--debug-fuse', action='store_true', default=False,
                         help='Enable FUSE debugging output')
+    parser.add_argument('-f', '--foreground', action='store_true', default=False,
+                        help='Run file system process in the foreground')
     return parser.parse_args()
 
 def load_config(tenant):
@@ -981,6 +983,9 @@ def main():
     tenant = options.tenant
     config = load_config(tenant)
     cred = authenticate(config)
+
+    if not options.foreground:
+        daemonize()
 
     graph_fs = GraphFS(tenant,
                        cred.get_token("https://graph.microsoft.com/.default").token)
