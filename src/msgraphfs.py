@@ -350,7 +350,9 @@ class FileNode(Node):
     async def release(self, fs):
         await self.flush(fs)
         self._writers -= 1
-        # TODO: handle when to forget the file!
+        if self._writers <= 0:
+            os.unlink(self._local_fh)
+            self._local_fh = None
 
     async def setattr(self, fs, attr, fields):
         if fields.size:

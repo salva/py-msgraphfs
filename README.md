@@ -74,10 +74,13 @@ with the required privileges to do it for you.
   it.
 
 - No credential refreshing: Once the authentication token expires the
-  file system stops working (the author knows how to handle that and
-  he is working on it!).
+  file system stops working (the author actually knows how to handle
+  that and he is working on it!).
 
 - No universal client id/secret. Blame Microsoft on this!
+
+- No internal locking. Locks must be used to ensure the consistence of
+  the data structures used internally by the program.
 
 - Several other unknown bugs.
 
