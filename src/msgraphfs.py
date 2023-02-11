@@ -210,7 +210,7 @@ class Node():
         mtime_iso8601 = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%dT%H:%M:%SZ')
 
         res = await fs._patch_as_json(self.url(),
-                                      data = { "lastModifiedDateTime": mtime_iso8601 })
+                                      json = { "lastModifiedDateTime": mtime_iso8601 })
         self._populate(fs, res)
 
     async def unlink(self, fs):
@@ -225,7 +225,7 @@ class Node():
 
     async def move(self, fs, new_parent, new_name):
         url = self.url("?@microsoft.graph.conflictBehavior=replace")
-        res = await fs._patch_as_json(url, data={ "parentReference": { "id": new_parent.real_id },
+        res = await fs._patch_as_json(url, json={ "parentReference": { "id": new_parent.real_id },
                                                   "name": u8(new_name) })
         self._populate(fs, res)
 
@@ -462,7 +462,7 @@ class FolderNode(DirNode):
     async def mkdir(self, fs, name):
         url = self.children_url()
         res = await fs._post_as_json(url,
-                                     data={ "name": u8(name),
+                                     json={ "name": u8(name),
                                             "folder": {},
                                             "@microsoft.graph.conflictBehavior": "fail" },
                                      accepted_codes=[201])
@@ -875,10 +875,10 @@ class GraphFS(pyfuse3.Operations):
             return GRAPH_URL + url
         return url
 
-    async def _send(self, method, url, accepted_codes=None, data=None, headers={}, **kwargs):
+    async def _send(self, method, url, accepted_codes=None, json=None, headers={}, **kwargs):
         headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
-        if data is not None:
-            kwargs["content"] = json.dumps(data)
+        if json is not None:
+            kwargs["content"] = json.dumps(json)
             headers["Content-Type"]="application/json"
         elif "content" in kwargs:
             headers.setdefault("Content-Type", "application/octet-stream")
