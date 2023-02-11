@@ -27,13 +27,13 @@ faulthandler.enable()
 UID = os.geteuid()
 GID = os.getegid()
 BLKSIZE = 65536
-graph_url = "https://graph.microsoft.com/v1.0"
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
 # expire data after given seconds
-external_expiration = 5
-expiration = 15
+KERNEL_EXPIRATION = 5
+LOCAL_EXPIRATION = 15
 
-startup_time_ns = math.floor(time.time() * 1e9)
+STARTUP_TIME = math.floor(time.time() * 1e9)
 
 PRIVATE_DIR = Path.home() / ".msgraphfs"
 
@@ -123,8 +123,8 @@ class Node():
         self._st = st
         st.st_ino = inode
         st.generation = 0
-        st.entry_timeout = external_expiration
-        st.attr_timeout = external_expiration
+        st.entry_timeout = KERNEL_EXPIRATION
+        st.attr_timeout = KERNEL_EXPIRATION
         st.st_mode = mode
         st.st_uid = UID
         st.st_gid = GID
@@ -148,7 +148,7 @@ class Node():
         self._populate(fs, res)
 
     def _populate(self, fs, res):
-        self.expiration = time.time() + expiration
+        self.expiration = time.time() + LOCAL_EXPIRATION
         self.real_id = res.get("id", self.id)
         st = self._st
         st.st_size = res.get("size", 0)
@@ -376,7 +376,7 @@ class DirNode(Node):
     def __init__(self, children = None, **kwargs):
         super().__init__(mode= stat.S_IFDIR | 0o700, **kwargs)
         self.children = children
-        self.children_expiration = time.time() + expiration
+        self.children_expiration = time.time() + LOCAL_EXPIRATION
 
     def is_dir(self):
         return True
@@ -402,7 +402,7 @@ class FolderNode(DirNode):
                 self.children_expiration = 0
                 return
             self.children = {}
-            self.children_expiration = time.time() + expiration
+            self.children_expiration = time.time() + LOCAL_EXPIRATION
 
         for name, value in unwrapped.items():
             child = self._unpack_child(fs, value)
@@ -570,9 +570,9 @@ class SyntheticNode(DirNode):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._st.st_ctime_ns = startup_time_ns
-        self._st.st_mtime_ns = startup_time_ns
-        self._st.st_atime_ns = startup_time_ns
+        self._st.st_ctime_ns = STARTUP_TIME
+        self._st.st_mtime_ns = STARTUP_TIME
+        self._st.st_atime_ns = STARTUP_TIME
 
     async def list(self, fs):
         if self.children is None:
@@ -872,7 +872,7 @@ class GraphFS(pyfuse3.Operations):
 
     def _mkurl(self, url):
         if url.startswith('/'):
-            return graph_url + url
+            return GRAPH_URL + url
         return url
 
     async def _send(self, method, url, accepted_codes=None, data=None, headers={}, **kwargs):
