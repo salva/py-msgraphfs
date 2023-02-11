@@ -877,10 +877,7 @@ class GraphFS(pyfuse3.Operations):
 
     async def _send(self, method, url, accepted_codes=None, json=None, headers={}, **kwargs):
         headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
-        if json is not None:
-            kwargs["content"] = json.dumps(json)
-            headers["Content-Type"]="application/json"
-        elif "content" in kwargs:
+        if "content" in kwargs:
             headers.setdefault("Content-Type", "application/octet-stream")
         url = self._mkurl(url)
         call = getattr(self._client, method)
