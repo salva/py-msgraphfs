@@ -82,9 +82,6 @@ with the required privileges to do it for you.
 - No internal locking. Locks must be used to ensure the consistence of
   the data structures used internally by the program.
 
-- No support for upload sessions. That means that files larger than
-  4MB will fail to upload (resulting in data lost).
-
 - Several other unknown bugs.
 
 Some of these bugs may be quite easy to fix, and just there because of

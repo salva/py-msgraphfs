@@ -27,11 +27,15 @@ faulthandler.enable()
 UID = os.geteuid()
 GID = os.getegid()
 BLKSIZE = 65536
+
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
 HTTP_MAX_RETRIES = 5
 HTTP_RETRY_DELAY = 3
 HTTP_TIMEOUT = 20
+
+UPLOAD_CHUNK_SIZE = 327680*10
+UPLOAD_MAX_RETRIES = 3
 
 # expire data after given seconds
 KERNEL_EXPIRATION = 5
@@ -309,6 +313,14 @@ class FileNode(Node):
         return self.url("/content")
 
     async def _upload_from_local(self, fs):
+        self._local_fh.flush()
+        size = os.fstat(self._local_fh.fileno()).st_size
+        if size <= 1024*1024:
+            return await self._upload_from_local_with_put(fs)
+        return await self._upload_from_local_with_session(fs)
+
+    async def _upload_from_local_with_put(self, fs):
+        self._local_fh.flush()
         url = await self.upload_url(fs)
         async def gen(file):
             file.seek(0)
@@ -321,6 +333,55 @@ class FileNode(Node):
         res = await fs._put_as_json(url, content = gen(self._local_fh))
         logging.info(f"File {self.id} uploaded")
         return res
+
+    async def _upload_from_local_with_session(self, fs):
+        self._local_fh.flush()
+        size = os.fstat(self._local_fh.fileno()).st_size
+        res = await fs._post_as_json(self.url("/createUploadSession"),
+                                     json = { "@microsoft.graph.conflictBehavior": "replace",
+                                              "fileSize": size })
+        if "uploadUrl" not in res:
+            logging.debug("uploadUrl missing in response {json.dumps(res)}")
+            EIO()
+        url = res["uploadUrl"]
+        pos = 0
+        code = 0
+        while True:
+            self._local_fh.seek(pos)
+            chunk_size = min(UPLOAD_CHUNK_SIZE, size - pos)
+            chunk = self._local_fh.read(chunk_size)
+            if len(chunk) == 0:
+                logging.error(f"Unable to read data from local file, size was {size} but data stopped comming at {pos}")
+
+            logging.debug(f"Uploading bytes {pos}-{pos+len(chunk)-1}/{size}")
+
+            res = await fs._put(url,
+                                accepted_codes=[200, 201, 202, 416],
+                                headers={"Content-Range": f"bytes {pos}-{pos+len(chunk)-1}/{size}"},
+                                         # "Content-Length": str(len(chunk))},
+                                authorize=False,
+                                content=chunk)
+            code = res.status_code
+            res = res.json()
+            if code == 416:
+                try:
+                    rng = res["nextExpectedRanges"][0]
+                    next = int(rng.split("-")[0])
+                except:
+                    logging.debug(f"Unable to recover next range (response: {json.dumps(res)})", exc_info=True)
+                    EIO()
+                if next < pos or next > size:
+                    logging.debug(f"Bad recovering position {next} (response: {json.dumps(res)})")
+                    EIO()
+                logging.debug(f"Resetting pos from {pos} to {next} of {size}, remote requested range: {rng}")
+                pos = next
+            else:
+                pos += len(chunk)
+
+            if pos == size:
+                if code in [200, 201]:
+                    return res
+                return
 
     async def open(self, fs, flags):
         logging.debug(f"open({self.id} [inode: {self._st.st_ino}], flags: {flags2set(flags)})")
@@ -357,7 +418,8 @@ class FileNode(Node):
         if self._changed:
             self._changed = False
             res = await self._upload_from_local(fs)
-            self._populate(fs, res)
+            if res is not None:
+                self._populate(fs, res)
 
     async def release(self, fs):
         await self.flush(fs)
@@ -887,8 +949,11 @@ class GraphFS(pyfuse3.Operations):
             return GRAPH_URL + url
         return url
 
-    async def _send(self, method, url, accepted_codes=None, json=None, headers={}, **kwargs):
-        headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
+    async def _send(self, method, url, accepted_codes=None, json=None, headers={}, authorize=True, **kwargs):
+        if authorize:
+            headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
+        else:
+            headers = { **headers }
         if "content" in kwargs:
             headers.setdefault("Content-Type", "application/octet-stream")
         url = self._mkurl(url)
@@ -930,8 +995,11 @@ class GraphFS(pyfuse3.Operations):
     def _get_to_file(self, url, local_fh, **kwargs):
         return self._send_to_file('get', url, local_fh, **kwargs)
 
-    async def _send_to_file(self, method, url, local_fh, accepted_codes=None, json=None, headers={}, **kwargs):
-        headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
+    async def _send_to_file(self, method, url, local_fh, accepted_codes=None, json=None, headers={}, authorize=True, **kwargs):
+        if authorize:
+            headers = { "Authorization": f"Bearer {self._graph_token}", **headers }
+        else:
+            headers = { **headers }
         if "content" in kwargs:
             headers.setdefault("Content-Type", "application/octet-stream")
         url = self._mkurl(url)
